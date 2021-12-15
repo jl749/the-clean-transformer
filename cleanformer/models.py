@@ -18,7 +18,7 @@ class Transformer(LightningModule):
         # A simple lookup table that stores embeddings of a fixed dictionary and size.
         self.token_embeddings = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_size)  # (vocab_size, hidden_size) embedding table
         
-        self.encoder = Encoder()
+        self.encoder = Encoder(hidden_size)
         self.decoder = Decoder()
 
 
@@ -92,7 +92,53 @@ class Transformer(LightningModule):
 
 
 class Encoder(torch.nn.Module):
-    raise NotImplementedError
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+
+        self.self_attention_layer = AttentionLayer()
+        # TODO - ffn
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: (N, L, H)
+        """
+        contexts = self.self_attention_layer.forward(q=x, k=x, v=x)
+
 
 class Decoder(torch.nn.Module):
-    raise NotImplementedError
+    pass
+
+
+class AttentionLayer(torch.nn.Module):
+    # TODO - multihead attention
+    
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.linear_q = torch.nn.Linear(hidden_size, hidden_size)
+        self.linear_k = torch.nn.Linear(hidden_size, hidden_size)
+        self.linear_v = torch.nn.Linear(hidden_size, hidden_size)
+        self.linear_o = torch.nn.Linear(..., ...)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        q: (N, L, H)
+        k: (N, L, H)
+        v: (N, L, H)
+        """
+        q = self.linear_q(q)  # (N, L, H) * (H, H)  -->  (N, L, H)
+        k = self.linear_k(k)  # (N, L, H) * (H, H)  -->  (N, L, H)
+        v = self.linear_v(v)  # (N, L, H) * (H, H)  -->  (N, L, H)
+
+
+        # TODO - scale
+
+        sims = torch.einsum("nlh,nlh->nll", q, k)
+
+        # TODO -masking (auto-regressive)
+
+        attentions = torch.softmax(sims, dim=2)  # (N, L(q.length), L(k.length)),  foreach query calcuate keys softmax
+
+        contexts = torch.einsum("nll,nlh->nlh", attentions, v)
+        contexts = torch.linear_o(contexts)  # (N, L, H)  -->  (N, L, H)
+        return contexts
