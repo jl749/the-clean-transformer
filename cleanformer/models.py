@@ -12,7 +12,10 @@ class Transformer(LightningModule):
         self.save_hyperparameters()
         
         # TODO: implement transformer
-        self.token_embeddings = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_size)  # vocab_size -> hidden_size
+
+        # A simple lookup table that stores embeddings of a fixed dictionary and size.
+        self.token_embeddings = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_size)  # (vocab_size, hidden_size) embedding table
+        
         self.encoder = Encoder()
         self.decoder = Decoder()
 
