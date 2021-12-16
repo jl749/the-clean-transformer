@@ -133,12 +133,12 @@ class AttentionLayer(torch.nn.Module):
 
         # TODO - scale
 
-        sims = torch.einsum("nlh,nlh->nll", q, k)
+        sims = torch.einsum("nqh,nkh->nqk", q, k)  # nlh,nlh->nll
 
-        # TODO -masking (auto-regressive)
+        # TODO - masking (auto-regressive)
 
         attentions = torch.softmax(sims, dim=2)  # (N, L(q.length), L(k.length)),  foreach query calcuate keys softmax
 
-        contexts = torch.einsum("nll,nlh->nlh", attentions, v)
+        contexts = torch.einsum("nqk,nkh->nqh", attentions, v)  # nll,nlh->nlh
         contexts = torch.linear_o(contexts)  # (N, L, H)  -->  (N, L, H)
         return contexts
