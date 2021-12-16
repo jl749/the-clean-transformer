@@ -18,7 +18,7 @@ class Transformer(LightningModule):
         # A simple lookup table that stores embeddings of a fixed dictionary and size.
         self.token_embeddings = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_size)  # (vocab_size, hidden_size) embedding table
         
-        self.encoder = Encoder(hidden_size)
+        self.encoder = Encoder(hidden_size, heads)
         self.decoder = Decoder()
 
 
@@ -93,10 +93,10 @@ class Transformer(LightningModule):
 
 class Encoder(torch.nn.Module):
 
-    def __init__(self, hidden_size: int) -> None:
+    def __init__(self, hidden_size: int, heads: int) -> None:
         super().__init__()
 
-        self.self_attention_layer = AttentionLayer()
+        self.self_attention_layer = MultiHeadAttentionLayer(hidden_size, heads)
         # TODO - ffn
 
     def forward(self, x: torch.Tensor):
@@ -104,21 +104,26 @@ class Encoder(torch.nn.Module):
         x: (N, L, H)
         """
         contexts = self.self_attention_layer.forward(q=x, k=x, v=x)
+        return contexts
 
 
 class Decoder(torch.nn.Module):
     pass
 
 
-class AttentionLayer(torch.nn.Module):
-    # TODO - multihead attention
+class MultiHeadAttentionLayer(torch.nn.Module):
     
-    def __init__(self, hidden_size: int) -> None:
+    def __init__(self, hidden_size: int, heads: int) -> None:
         super().__init__()
+        self.hidden_size = hidden_size
+        self.heads = heads  # how many heads?
+
+        assert self.hidden_size % self.heads == 0  # hidden_size H must be divisible by heads
+
         self.linear_q = torch.nn.Linear(hidden_size, hidden_size)
         self.linear_k = torch.nn.Linear(hidden_size, hidden_size)
         self.linear_v = torch.nn.Linear(hidden_size, hidden_size)
-        self.linear_o = torch.nn.Linear(..., ...)
+        self.linear_o = torch.nn.Linear(hidden_size, hidden_size)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
@@ -126,19 +131,25 @@ class AttentionLayer(torch.nn.Module):
         k: (N, L, H)
         v: (N, L, H)
         """
+        N, L, _ = q.size()
+
         q = self.linear_q(q)  # (N, L, H) * (H, H)  -->  (N, L, H)
         k = self.linear_k(k)  # (N, L, H) * (H, H)  -->  (N, L, H)
         v = self.linear_v(v)  # (N, L, H) * (H, H)  -->  (N, L, H)
 
+        head_size = self.hidden_size//self.heads
+        # split heads: (N, L, H)  -->  (N, L/heads, heads)
+        q = q.reshape(N, L, self.heads, head_size)
+        k = k.reshape(N, L, self.heads, head_size)
+        v = v.reshape(N, L, self.heads, head_size)
 
-        # TODO - scale
-
-        sims = torch.einsum("nqh,nkh->nqk", q, k)  # nlh,nlh->nll
+        sims = torch.einsum("nqhs,nkhs->nhqk", q, k)  # (N, L, heads, head_size) * (N, L, heads, head_size) --> (N, heads, L, L)
 
         # TODO - masking (auto-regressive)
 
-        attentions = torch.softmax(sims, dim=2)  # (N, L(q.length), L(k.length)),  foreach query calcuate keys softmax
+        attentions = torch.softmax(sims, dim=3)  # (N, L(q.length), L(k.length)),  foreach query calcuate keys softmax
 
-        contexts = torch.einsum("nqk,nkh->nqh", attentions, v)  # nll,nlh->nlh
-        contexts = torch.linear_o(contexts)  # (N, L, H)  -->  (N, L, H)
+        contexts = torch.einsum("nhqk,nkhs->nqhs", attentions, v)  # (N, heads, L, L) * (N, L, H, head_size)  -->  (N, L, heads, head_size)
+        contexts = contexts.reshape(N, L, self.hidden_size)  # (N, L, heads, head_size)  -->  (N, L, H)
+        contexts = self.linear_o(contexts)  # (N, L, H)  -->  (N, L, H)
         return contexts
