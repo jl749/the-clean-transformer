@@ -1,4 +1,5 @@
 from typing import Dict, Tuple
+from cleanformer.tensors import subsequent_mask
 import torch
 from pytorch_lightning import LightningModule
 
@@ -18,8 +19,8 @@ class Transformer(LightningModule):
         # A simple lookup table that stores embeddings of a fixed dictionary and size.
         self.token_embeddings = torch.nn.Embedding(num_embeddings=vocab_size, embedding_dim=hidden_size)  # (vocab_size, hidden_size) embedding table
         
-        self.encoder = Encoder(hidden_size, heads)
-        self.decoder = Decoder()
+        self.encoder = Encoder(hidden_size, heads, max_length)
+        self.decoder = Decoder(hidden_size, heads, max_length)
 
 
     # override
@@ -93,30 +94,56 @@ class Transformer(LightningModule):
 
 class Encoder(torch.nn.Module):
 
-    def __init__(self, hidden_size: int, heads: int) -> None:
+    def __init__(self, hidden_size: int, heads: int, max_length: int) -> None:
         super().__init__()
 
-        self.self_attention_layer = MultiHeadAttentionLayer(hidden_size, heads)
+        self.multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=False)
         # TODO - ffn
 
+    # override
     def forward(self, x: torch.Tensor):
         """
         x: (N, L, H)
+        return vector with contectual meanings encoded
         """
-        contexts = self.self_attention_layer.forward(q=x, k=x, v=x)
+        contexts = self.multiHead_selfAttention_layer.forward(q=x, k=x, v=x)
         return contexts
 
 
 class Decoder(torch.nn.Module):
-    pass
+    
+    def __init__(self, hidden_size: int, heads: int, max_length: int) -> None:
+        super().__init__()
+        self.masked_multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=True)
+
+    # override
+    def forward(self, x: torch.Tensor, memory: torch.Tensor):
+        """
+        x: (N, L, H)
+        memory: encoder output
+        return vector with contectual meanings encoded
+        """
+        contexts = self.multiHead_selfAttention_layer.forward(q=x, k=x, v=x)
+        return contexts
+
+        # TODO: ffn(feed-forward), residual connection
+
 
 
 class MultiHeadAttentionLayer(torch.nn.Module):
     
-    def __init__(self, hidden_size: int, heads: int) -> None:
+    def __init__(self, hidden_size: int, heads: int, max_length: int, masked: bool) -> None:
+        """
+        hidden_size = H
+        heads = number of self attention heads
+        max_length = max length of L
+        masked = masked MultiHeadAttention?
+        """
         super().__init__()
         self.hidden_size = hidden_size
         self.heads = heads  # how many heads?
+        self.max_length = max_length
+        self.masked = masked
 
         assert self.hidden_size % self.heads == 0  # hidden_size H must be divisible by heads
 
@@ -125,13 +152,18 @@ class MultiHeadAttentionLayer(torch.nn.Module):
         self.linear_v = torch.nn.Linear(hidden_size, hidden_size)
         self.linear_o = torch.nn.Linear(hidden_size, hidden_size)
 
+        # const tensor in register_buffer
+        # 나중에 model.device("cuda") 모델과 함께 상수텐서도 같이 GPU load
+        self.register_buffer("subsequent_mask", subsequent_mask(max_length))
+
+    # override
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
         q: (N, L, H)
         k: (N, L, H)
         v: (N, L, H)
         """
-        N, L, _ = q.size()
+        N, _, _ = q.size()
 
         q = self.linear_q(q)  # (N, L, H) * (H, H)  -->  (N, L, H)
         k = self.linear_k(k)  # (N, L, H) * (H, H)  -->  (N, L, H)
@@ -139,17 +171,22 @@ class MultiHeadAttentionLayer(torch.nn.Module):
 
         head_size = self.hidden_size//self.heads
         # split heads: (N, L, H)  -->  (N, L/heads, heads)
-        q = q.reshape(N, L, self.heads, head_size)
-        k = k.reshape(N, L, self.heads, head_size)
-        v = v.reshape(N, L, self.heads, head_size)
+        q = q.reshape(N, self.max_length, self.heads, head_size)
+        v = v.reshape(N, self.max_length, self.heads, head_size)
+        k = k.reshape(N, self.max_length, self.heads, head_size)
 
         sims = torch.einsum("nqhs,nkhs->nhqk", q, k)  # (N, L, heads, head_size) * (N, L, heads, head_size) --> (N, heads, L, L)
 
-        # TODO - masking (auto-regressive)
+        # masking (auto-regressive)
+        if self.masked:
+            # mask = subsequent_mask(L)  # (L, L)  CUDA err, do not create tensor in func, create inside constructor
+            mask = self.subsequent_mask.reahspe(1, 1, self.max_length, self.max_length)\
+                        .expand(N, self.heads, -1, -1)  # (1, 1, L, L)  -->  (N, heads, L, L)
+            sims = torch.masked_fill(sims, mask == 0, value=float('-inf'))  # 
 
         attentions = torch.softmax(sims, dim=3)  # (N, L(q.length), L(k.length)),  foreach query calcuate keys softmax
 
         contexts = torch.einsum("nhqk,nkhs->nqhs", attentions, v)  # (N, heads, L, L) * (N, L, H, head_size)  -->  (N, L, heads, head_size)
-        contexts = contexts.reshape(N, L, self.hidden_size)  # (N, L, heads, head_size)  -->  (N, L, H)
+        contexts = contexts.reshape(N, self.max_length, self.hidden_size)  # (N, L, heads, head_size)  -->  (N, L, H)
         contexts = self.linear_o(contexts)  # (N, L, H)  -->  (N, L, H)
         return contexts
