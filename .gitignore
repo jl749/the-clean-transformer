@@ -132,3 +132,5 @@ data
 artifacts
 wandb
 korpora
+
+.idea/
