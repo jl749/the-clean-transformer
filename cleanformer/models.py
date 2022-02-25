@@ -1,3 +1,4 @@
+import math
 from typing import Dict, Tuple
 from cleanformer.tensors import subsequent_mask
 import torch
@@ -140,25 +141,22 @@ class Decoder(nn.Module):
 
 class MultiHeadAttentionLayer(nn.Module):
 
-    def __init__(self, hidden_size: int, heads: int, max_length: int, masked: bool) -> None:
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int, masked: bool) -> None:
         """
         hidden_size = H
+        encoding_size = E
         heads = number of self attention heads
         max_length = max length of L
         masked = masked MultiHeadAttention?
         """
         super().__init__()
         self.hidden_size = hidden_size
+        self.encoding_size = encoding_size
         self.heads = heads  # how many heads?
-        self.max_length = max_length
+        self.max_length = max_length  # L
         self.masked = masked
 
-        assert self.hidden_size % self.heads == 0  # hidden_size H must be divisible by heads
-
-        self.linear_q = nn.Linear(hidden_size, hidden_size)
-        self.linear_k = nn.Linear(hidden_size, hidden_size)
-        self.linear_v = nn.Linear(hidden_size, hidden_size)
-        self.linear_o = nn.Linear(hidden_size, hidden_size)
+        self.linear_o = nn.Linear(encoding_size*heads, hidden_size)
 
         # const tensor in register_buffer
         # 나중에 model.device("cuda") 모델과 함께 상수텐서도 같이 GPU load
@@ -174,33 +172,16 @@ class MultiHeadAttentionLayer(nn.Module):
         """
         N, _, _ = q.size()
 
-        q = self.linear_q(q)  # (N, L, H) * (H, H)  -->  (N, L, H)
-        k = self.linear_k(k)  # (N, L, H) * (H, H)  -->  (N, L, H)
-        v = self.linear_v(v)  # (N, L, H) * (H, H)  -->  (N, L, H)
+        attention = AttentionLayer(self.hidden_size, self.encoding_size)
 
-        head_size = self.hidden_size // self.heads
-        # split heads: (N, L, H)  -->  (N, L, heads, H/heads)
-        q = q.reshape(N, self.max_length, self.heads, head_size)
-        k = k.reshape(N, self.max_length, self.heads, head_size)
-        v = v.reshape(N, self.max_length, self.heads, head_size)
+        result = attention(q, k, v)  # (N, L * heads, E)
+        for _ in range(self.heads - 1):
+            head = attention(q, k, v)  # (N, L, E)
+            result = torch.cat((result, head), dim=2)
 
-        sims = torch.einsum("nqhs,nkhs->nhqk", q,
-                            k)  # (N, L, heads, head_size) * (N, L, heads, head_size) --> (N, heads, L, L)
+        context = self.linear_o(result)  # (N, L, H)
 
-        # masking (auto-regressive)
-        if self.masked:
-            # mask = subsequent_mask(L)  # (L, L)  CUDA err, do not create tensor in func, create inside constructor
-            mask = self.subsequent_mask.reahspe(1, 1, self.max_length, self.max_length) \
-                .expand(N, self.heads, -1, -1)  # (1, 1, L, L)  -->  (N, heads, L, L)
-            sims = torch.masked_fill(sims, mask == 0, value=float('-inf'))  # 
-
-        attentions = torch.softmax(sims, dim=3)  # (N, L(q.length), L(k.length)),  foreach query calcuate keys softmax
-
-        contexts = torch.einsum("nhqk,nkhs->nqhs", attentions,
-                                v)  # (N, heads, L, L) * (N, L, heads, head_size)  -->  (N, L, heads, head_size)
-        contexts = contexts.reshape(N, self.max_length, self.hidden_size)  # (N, L, heads, head_size)  -->  (N, L, H)
-        contexts = self.linear_o(contexts)  # (N, L, H)  -->  (N, L, H)
-        return contexts
+        return context
 
 
 class AttentionLayer(nn.Module):
@@ -223,9 +204,7 @@ class AttentionLayer(nn.Module):
 
         # TODO: masking for decoder (auto-regressive)
 
-        attention = F.softmax(sim / torch.sqrt(L), dim=-1)  # (N, L, L)
-
+        attention = F.softmax(sim / math.sqrt(L), dim=-1)  # (N, L, L)
         context = attention @ v  # (N, L, L) @ (N, L, E) --> (N, L, E)
-        context = self.linear_o(context)
 
         return context
