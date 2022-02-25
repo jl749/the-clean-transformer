@@ -2,6 +2,7 @@ from typing import Dict, Tuple
 from cleanformer.tensors import subsequent_mask
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pytorch_lightning import LightningModule
 
 
@@ -60,14 +61,15 @@ class Transformer(LightningModule):
 
         hidden = self.forward(src_ids, tgt_ids, src_key_padding_mask, tgt_key_padding_mask)
         classifier = self.token_embeddings.weight  # (V, H)  V = BoW classes
-        logits = torch.einsum("nlh,vh->nvl", hidden, classifier)
-        loss = nn.functional.cross_entropy(logits, Y)  # CEE requires (N, classes, L), (N, L)
-        loss = loss.sum()  # (N,) -> (,)
+        logits = torch.einsum("nlh,vh->nvl", hidden, classifier)  # logits --> NCL (channels first)
+        loss = F.cross_entropy(logits, Y)  # CEE requires (N, classes, L), (N, L)
+        loss = loss.sum()  # (N,) -> scalar
 
         return {
             "loss": loss,
         }
 
+    # custom method for "INFERENCE" only
     def predict(self, X: torch.Tensor) -> torch.Tensor:
         """
         param X (N, 2, 2, L)
@@ -76,7 +78,7 @@ class Transformer(LightningModule):
 
         # encoder inputs  (N, L)
         src_ids, src_key_padding_mask = X[:, 0, 0], X[:, 0, 1]
-        # decoder inputs  (N, L)
+        # decoder inputs  (N, L)  --  when doing the inference ['[BOS]', '[PAD]', '[PAD]' ...]
         tgt_ids, tgt_key_padding_mask = X[:, 1, 0], X[:, 1, 1]
 
         for time in range(0, self.hparams['max_length'] - 1):
@@ -84,12 +86,13 @@ class Transformer(LightningModule):
             hidden = self.forward(src_ids, tgt_ids, src_key_padding_mask, tgt_key_padding_mask)  # (N, L, H)
             classifier = self.token_embeddings.weight  # (V, H)  V = BoW classes
 
+            # (N, L, V) --> foreach tokenized word in L show prob distribution
             logits = torch.einsum("nlh,vh->nlv", hidden,
-                                  classifier)  # THIS IS greedy decoding, look up beem search algo!!!
-            ids = torch.argmax(logits, dim=2)  # (N, L, V)  -->  (N, L)
+                                  classifier)  # TODO: THIS IS greedy decoding, look up beem search algo!!!
+            ids = torch.argmax(logits, dim=2)  # (N, L, V)  -->  (N, L); highest prob indexes
 
             # pass current output to next input
-            next_id = ids[:, time]  # (N, L) -->  (N, )
+            next_id = ids[:, time]  # (N, L) -->  (N,)
 
             tgt_ids[:, time + 1] = next_id
             tgt_key_padding_mask[:, time + 1] = 0  # not padding anymore
@@ -167,6 +170,7 @@ class MultiHeadAttentionLayer(nn.Module):
         q: (N, L, H)
         k: (N, L, H)
         v: (N, L, H)
+        return contexts (N, L, H)
         """
         N, _, _ = q.size()
 
@@ -175,10 +179,10 @@ class MultiHeadAttentionLayer(nn.Module):
         v = self.linear_v(v)  # (N, L, H) * (H, H)  -->  (N, L, H)
 
         head_size = self.hidden_size // self.heads
-        # split heads: (N, L, H)  -->  (N, L/heads, heads)
+        # split heads: (N, L, H)  -->  (N, L, heads, H/heads)
         q = q.reshape(N, self.max_length, self.heads, head_size)
-        v = v.reshape(N, self.max_length, self.heads, head_size)
         k = k.reshape(N, self.max_length, self.heads, head_size)
+        v = v.reshape(N, self.max_length, self.heads, head_size)
 
         sims = torch.einsum("nqhs,nkhs->nhqk", q,
                             k)  # (N, L, heads, head_size) * (N, L, heads, head_size) --> (N, heads, L, L)
@@ -193,7 +197,35 @@ class MultiHeadAttentionLayer(nn.Module):
         attentions = torch.softmax(sims, dim=3)  # (N, L(q.length), L(k.length)),  foreach query calcuate keys softmax
 
         contexts = torch.einsum("nhqk,nkhs->nqhs", attentions,
-                                v)  # (N, heads, L, L) * (N, L, H, head_size)  -->  (N, L, heads, head_size)
+                                v)  # (N, heads, L, L) * (N, L, heads, head_size)  -->  (N, L, heads, head_size)
         contexts = contexts.reshape(N, self.max_length, self.hidden_size)  # (N, L, heads, head_size)  -->  (N, L, H)
         contexts = self.linear_o(contexts)  # (N, L, H)  -->  (N, L, H)
         return contexts
+
+
+class AttentionLayer(nn.Module):
+
+    def __init__(self, hidden_size: int, encoding_size: int) -> None:
+        super().__init__()
+        self.linear_q = nn.Linear(hidden_size, encoding_size)
+        self.linear_k = nn.Linear(hidden_size, encoding_size)
+        self.linear_v = nn.Linear(hidden_size, encoding_size)
+        self.linear_o = nn.Linear(encoding_size, hidden_size)
+
+    def forward(self, q, k, v) -> torch.Tensor:
+        N, L, _ = q.size()
+
+        q = self.linear_q(q)  # (N, L, E)
+        k = self.linear_k(k)  # (N, L, E)
+        v = self.linear_v(v)  # (N, L, E)
+
+        sim = q @ k.permute(0, 2, 1)  # (N, L, L)
+
+        # TODO: masking for decoder (auto-regressive)
+
+        attention = F.softmax(sim / torch.sqrt(L), dim=-1)  # (N, L, L)
+
+        context = attention @ v  # (N, L, L) @ (N, L, E) --> (N, L, E)
+        context = self.linear_o(context)
+
+        return context
