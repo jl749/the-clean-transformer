@@ -171,10 +171,6 @@ class MultiHeadAttentionLayer(nn.Module):
 
         self.linear_o = nn.Linear(encoding_size * heads, hidden_size)
 
-        # const tensor in register_buffer
-        # 나중에 model.device("cuda") 모델과 함께 상수텐서도 같이 GPU load
-        self.register_buffer("subsequent_mask", subsequent_mask(max_length))
-
     # override
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
@@ -185,9 +181,11 @@ class MultiHeadAttentionLayer(nn.Module):
         """
         N, _, _ = q.size()
 
-        result = AttentionLayer(self.hidden_size, self.encoding_size, self.masked)(q, k, v)  # (N, L * heads, E)
+        tmp = AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked)  # (N, L * heads, E)
+        result = tmp(q, k, v)
         for _ in range(self.heads - 1):
-            head = AttentionLayer(self.hidden_size, self.encoding_size, self.masked)(q, k, v)  # (N, L, E)
+            tmp = AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked)
+            head = tmp(q, k, v)  # (N, L, E)
             result = torch.cat((result, head), dim=2)
 
         context = self.linear_o(result)  # (N, L, H)
@@ -197,13 +195,17 @@ class MultiHeadAttentionLayer(nn.Module):
 
 class AttentionLayer(nn.Module):
 
-    def __init__(self, hidden_size: int, encoding_size: int, masked: bool) -> None:
+    def __init__(self, hidden_size: int, encoding_size: int, max_length: int, masked: bool) -> None:
         super().__init__()
         self.linear_q = nn.Linear(hidden_size, encoding_size)
         self.linear_k = nn.Linear(hidden_size, encoding_size)
         self.linear_v = nn.Linear(hidden_size, encoding_size)
         self.linear_o = nn.Linear(encoding_size, hidden_size)
         self.masked = masked
+
+        # const tensor in register_buffer
+        # 나중에 model.device("cuda") 모델과 함께 상수텐서도 같이 GPU load
+        self.register_buffer("subsequent_mask", subsequent_mask(max_length))
 
     def forward(self, q, k, v) -> torch.Tensor:
         N, L, _ = q.size()
