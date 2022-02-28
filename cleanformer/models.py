@@ -9,7 +9,7 @@ from pytorch_lightning import LightningModule
 
 # TODO: implement transformer
 class Transformer(LightningModule):
-    def __init__(self, hidden_size: int, ffn_size: int,
+    def __init__(self, hidden_size: int, encoding_size: int, ffn_size: int,
                  vocab_size: int, max_length: int,
                  pad_token_id: int, heads: int, depth: int,
                  dropout: float, lr: float):  # noqa
@@ -23,8 +23,8 @@ class Transformer(LightningModule):
         # A simple lookup table that stores embeddings of a fixed dictionary and size
         self.token_embeddings = nn.Embedding(num_embeddings=vocab_size,
                                              embedding_dim=hidden_size)  # (vocab_size, hidden_size) table
-        self.encoder = Encoder(hidden_size, heads, max_length)
-        self.decoder = Decoder(hidden_size, heads, max_length)
+        self.encoder = Encoder(hidden_size, encoding_size, heads, max_length)
+        self.decoder = Decoder(hidden_size, encoding_size, heads, max_length)
         # ==================== trainable layers ==================== #
 
     # Use for inference only
@@ -42,8 +42,8 @@ class Transformer(LightningModule):
         # POSITIONAL ENCODING
         # TODO: later
 
-        context_info = self.encoder.forward(src)  # (N, L, H) --> (N, L, H), shape does not change; add contextual info
-        hidden = self.decoder.forward(tgt, context_info)  # (N, L, H) --> (N, L, H), decoder takes 2 inputs
+        context_info = self.encoder(src)  # (N, L, H) --> (N, L, H), shape does not change; add contextual info
+        hidden = self.decoder(tgt, context_info)  # (N, L, H) --> (N, L, H), decoder takes 2 inputs
         return hidden
 
     # the complete training loop
@@ -104,10 +104,16 @@ class Transformer(LightningModule):
 
 class Encoder(nn.Module):
 
-    def __init__(self, hidden_size: int, heads: int, max_length: int) -> None:
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int) -> None:
+        """
+        hidden_size: original feature level
+        encoding_size: encoded feature level (reduced)
+        heads: num of heads
+        max_length: max token length
+        """
         super().__init__()
-
-        self.multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=False)
+        self.multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, encoding_size,
+                                                                     heads, max_length, masked=False)
         # TODO - ffn
 
     # override
@@ -122,9 +128,16 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
 
-    def __init__(self, hidden_size: int, heads: int, max_length: int) -> None:
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int) -> None:
+        """
+        hidden_size: original feature level
+        encoding_size: encoded feature level (reduced)
+        heads: num of heads
+        max_length: max token length
+        """
         super().__init__()
-        self.masked_multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, heads, max_length, masked=True)
+        self.masked_multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, encoding_size,
+                                                                            heads, max_length, masked=True)
 
     # override
     def forward(self, x: torch.Tensor, context_info: torch.Tensor):
