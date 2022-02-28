@@ -217,7 +217,7 @@ class AttentionLayer(nn.Module):
         sim = q @ k.permute(0, 2, 1)  # (N, L, L)
 
         if self.masked:
-            mask = subsequent_mask(L).repeat(N, 1, 1)  # (L, L) --> (N, L, L)
+            mask = self.subsequent_mask.repeat(N, 1, 1)  # (L, L) --> (N, L, L)
             sim = sim.masked_fill(mask == 0, value=float("-inf"))
 
         attention = F.softmax(sim / math.sqrt(L), dim=-1)  # (N, L, L)
