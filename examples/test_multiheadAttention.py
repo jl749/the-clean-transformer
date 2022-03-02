@@ -16,7 +16,9 @@ def main():
     k = torch.rand(size=[N, L, hidden_size])
     v = torch.rand(size=[N, L, hidden_size])
 
-    out = layer.forward(q, k, v)
+    key_padding_mask = torch.ones(size=[N, L]).long()
+
+    out = layer.forward(q, k, v, key_padding_mask)
     print(out)
 
 
