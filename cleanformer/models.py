@@ -1,10 +1,14 @@
 import math
-from typing import Dict, Tuple
-from cleanformer.tensors import subsequent_mask
+from typing import Dict, Tuple, List
+
+from tqdm import tqdm
+
+from cleanformer.tensors import subsequent_mask, pos_encodings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_lightning import LightningModule
+from torchmetrics import Accuracy
 
 
 # TODO: implement transformer
@@ -23,9 +27,16 @@ class Transformer(LightningModule):
         # A simple lookup table that stores embeddings of a fixed dictionary and size
         self.token_embeddings = nn.Embedding(num_embeddings=vocab_size,
                                              embedding_dim=hidden_size)  # (vocab_size, hidden_size) table
-        self.encoder = Encoder(hidden_size, encoding_size, heads, max_length)
-        self.decoder = Decoder(hidden_size, encoding_size, heads, max_length)
+        self.encoder = Encoder(hidden_size, encoding_size, heads, max_length, depth, ffn_size, dropout)
+        self.decoder = Decoder(hidden_size, encoding_size, heads, max_length, depth, ffn_size, dropout)
         # ==================== trainable layers ==================== #
+
+        # TODO: accuracy
+        self.acc_train = Accuracy(ignore_index=pad_token_id)
+        self.acc_val = Accuracy(ignore_index=pad_token_id)
+        self.acc_test = Accuracy(ignore_index=pad_token_id)
+
+        self.register_buffer("pos_encodings", pos_encodings(max_length, hidden_size))  # (L, H)
 
     # Use for inference only
     def forward(self, src_ids: torch.LongTensor, tgt_ids: torch.Tensor,
@@ -40,21 +51,38 @@ class Transformer(LightningModule):
         tgt = self.token_embeddings(tgt_ids)  # (N, L) --> (N, L, H)
 
         # POSITIONAL ENCODING
-        # TODO: later
+        src += self.pos_encodings  # (N, L, H) + (L, H) --> (N, L, H)
+        tgt += self.pos_encodings  # (N, L, H) + (L, H) --> (N, L, H)
 
-        context_info = self.encoder(src)  # (N, L, H) --> (N, L, H), shape does not change; add contextual info
-        hidden = self.decoder(tgt, context_info)  # (N, L, H) --> (N, L, H), decoder takes 2 inputs
+        # (N, L, H) --> (N, L, H), shape does not change; add contextual info
+        context_info = self.encoder(src, src_key_padding_mask)
+        hidden = self.decoder(tgt, context_info, tgt_key_padding_mask, src_key_padding_mask)  # decoder takes 2 inputs
+
         return hidden
 
-    # the complete training loop
-    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], **kwargs) -> Dict:
-        """
-        batch --> output of your DataLoader
-        """
-        X, Y = batch  # (N, 2, 2, L) (N, L)
-        # [ N = batch size, 2(src(KO) | target(ENG)), 2(ids | mask(padding)), L(sequence max length) ]
-        # Decoder input starts with [BOS] token
+    def on_train_start(self):
+        # many deep transformer models are initialised with so-called "Xavier initialisation"
+        # refer to: https://proceedings.mlr.press/v9/glorot10a/glorot10a.pdf
+        for param in tqdm(self.parameters(), desc="initialising weights..."):
+            if param.dim() > 1:
+                torch.nn.init.xavier_uniform_(param)
 
+    def on_train_batch_end(self, outputs: dict, *args, **kwargs):
+        self.log("Train/Loss", outputs['loss'])
+
+    def configure_optimizers(self) -> dict:
+        optimizer = torch.optim.Adam(params=self.parameters(), lr=self.hparams['lr'],
+                                     betas=(0.9, 0.98), eps=1e-9)
+        return {
+            'optimizer': optimizer
+        }
+
+    # custom method that returns loss, logit_output
+    def _step(self, X: torch.Tensor, Y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        X: (N, 2, 2, L)
+        Y: (N, L)
+        """
         # encoder inputs  (N, L)
         src_ids, src_key_padding_mask = X[:, 0, 0], X[:, 0, 1]
         # decoder inputs  (N, L)
@@ -66,11 +94,25 @@ class Transformer(LightningModule):
         loss = F.cross_entropy(logits, Y)  # CEE requires (N, classes, L), (N, L)
         loss = loss.sum()  # (N,) -> scalar
 
+        return loss, logits
+
+    # the complete training loop
+    def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], **kwargs) -> Dict:
+        """
+        batch: output of your DataLoader
+        return: a scalar tensor containing the loss for this batch
+        """
+        X, Y = batch  # (N, 2, 2, L) (N, L)
+        # [ N = batch size, 2(src(KO) | target(ENG)), 2(ids | mask(padding)), L(sequence max length) ]
+        # Decoder input starts with [BOS] token
+
+        loss, logits = self._step(X, Y)
+
         return {
             "loss": loss,
         }
 
-    # custom method for "INFERENCE" only
+    # custom method used for "INFERENCE" only
     def predict(self, X: torch.Tensor) -> torch.Tensor:
         """
         param X (N, 2, 2, L)
@@ -102,33 +144,114 @@ class Transformer(LightningModule):
         return label_ids
 
 
+class FeedForward(torch.nn.Module):
+    """
+    position-wise feedforward network.
+    """
+
+    def __init__(self, hidden_size: int, ffn_size: int, dropout: float):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(hidden_size, ffn_size),
+            nn.ReLU(),
+            nn.Linear(ffn_size, hidden_size),
+            nn.Dropout(dropout),
+            nn.LayerNorm(hidden_size)
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        :param x: (N, L, H)
+        :return: x (hidden): (N, L, H)
+        """
+        return self.layers(x)
+
+
+class EncoderLayer(torch.nn.Module):
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int,
+                 ffn_size: int, dropout: float):
+        super().__init__()
+        self.self_attention = MultiHeadAttentionLayer(hidden_size, encoding_size, max_length, heads)
+        self.ffn = FeedForward(hidden_size, ffn_size, dropout)
+
+    def forward(self, x: torch.Tensor, x_key_padding_mask: torch.LongTensor) -> torch.Tensor:
+        """
+        :param x (N, L, H)
+        :param x_key_padding_mask (N, L)
+        :return: src_hidden: (N, L, H)
+        """
+        # contextualised x with itself
+        x = self.self_attention(q=x, k=x, v=x, key_padding_mask=x_key_padding_mask) + x  # residual
+        # apply linear transformation to each positional identically but independently
+        x = self.ffn(x) + x  # residual
+        return x
+
+
 class Encoder(nn.Module):
 
-    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int) -> None:
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int,
+                 depth: int, ffn_size: int, dropout: float) -> None:
         """
         hidden_size: original feature level
         encoding_size: encoded feature level (reduced)
         heads: num of heads
         max_length: max token length
+        depth: how many times to repeat encoder
         """
         super().__init__()
-        self.multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, encoding_size,
-                                                                     heads, max_length, masked=False)
-        # TODO - ffn
+        self.self_attention = MultiHeadAttentionLayer(hidden_size, encoding_size, heads, max_length)
+        # TODO - ffn, EncoderLayer
+        self.layers = torch.nn.ModuleList([
+            EncoderLayer(hidden_size, encoding_size, heads, max_length, ffn_size, dropout)
+            for _ in range(depth)
+        ])
 
     # override
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, x_key_padding_mask: torch.LongTensor):
         """
         x: (N, L, H)
-        return vector with contectual meanings encoded
+        return a vector with contextual meanings encoded
         """
-        contexts = self.multiHead_selfAttention_layer.forward(q=x, k=x, v=x)
-        return contexts
+        for layer in self.layers:
+            x = layer(x, x_key_padding_mask)
+        return x
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int,
+                 ffn_size: int, dropout: float):
+        super().__init__()
+
+        # masked, multi-head self-attention layer
+        self.masked_mhsa_layer = MultiHeadAttentionLayer(hidden_size, encoding_size, heads, max_length, masked=True)
+        # not masked, multi-head encoder-decoder attention layer
+        self.mheda_layer = MultiHeadAttentionLayer(hidden_size, encoding_size, heads, max_length)
+        # position-wise feed-forward network
+        self.ffn = FeedForward(hidden_size, ffn_size, dropout)
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor,
+                x_key_padding_mask: torch.LongTensor, memory_key_padding_mask: torch.LongTensor) \
+            -> torch.Tensor:
+        """
+        :param: x (N, L, H)
+        :param: memory (the output of the encoder) (N, L, H)
+        :param: x_key_padding_mask  (N, L)
+        :param: memory_key_padding_mask (N, L)
+        :return: x (contextualised)
+        """
+        # contextualise x with itself
+        x = self.masked_mhsa_layer.forward(q=x, k=x, v=x, key_padding_mask=x_key_padding_mask) + x  # residual
+        # soft-align memory with respect to x
+        x = self.mheda_layer.forward(q=x, k=memory, v=memory, key_padding_mask=memory_key_padding_mask) + x  # residual
+        # apply linear transformation to each position independently but identically
+        x = self.ffn(x) + x  # residual
+        return x
 
 
 class Decoder(nn.Module):
 
-    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int) -> None:
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int,
+                 depth: int, ffn_size: int, dropout: float) -> None:
         """
         hidden_size: original feature level
         encoding_size: encoded feature level (reduced)
@@ -136,25 +259,32 @@ class Decoder(nn.Module):
         max_length: max token length
         """
         super().__init__()
-        self.masked_multiHead_selfAttention_layer = MultiHeadAttentionLayer(hidden_size, encoding_size,
-                                                                            heads, max_length, masked=True)
+        self.layers = torch.nn.ModuleList([
+            DecoderLayer(hidden_size, encoding_size, heads, max_length, ffn_size, dropout)
+            for _ in range(depth)
+        ])
 
     # override
-    def forward(self, x: torch.Tensor, context_info: torch.Tensor):
+    def forward(self, x: torch.Tensor, encoder_contexts: torch.Tensor,
+                x_key_padding_mask: torch.LongTensor, c_key_padding_mask: torch.LongTensor):
         """
         x: (N, L, H)
-        memory: encoder output
-        return vector with contectual meanings encoded
+        encoder_contexts: encoder output
+        x_key_padding_mask: x key_padding_mask
+        c_key_padding_mask: anchor_contexts key_padding_mask
+        return vector with contextual meanings encoded
         """
-        contexts = self.multiHead_selfAttention_layer.forward(q=x, k=x, v=x)
-        return contexts
+        contexts = self.masked_self_attention(q=x, k=x, v=x, key_padding_mask=x_key_padding_mask)
+        alignments = self.encoder_decoder_attention(q=contexts, k=encoder_contexts, v=encoder_contexts,
+                                                    key_padding_mask=c_key_padding_mask)
+        return alignments
 
         # TODO: ffn(feed-forward), residual connection
 
 
 class MultiHeadAttentionLayer(nn.Module):
 
-    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int, masked: bool) -> None:
+    def __init__(self, hidden_size: int, encoding_size: int, heads: int, max_length: int, masked: bool = False) -> None:
         """
         hidden_size = H
         encoding_size = E
@@ -172,21 +302,23 @@ class MultiHeadAttentionLayer(nn.Module):
         self.linear_o = nn.Linear(encoding_size * heads, hidden_size)
 
     # override
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                key_padding_mask: torch.LongTensor) -> torch.Tensor:
         """
         q: (N, L, H)
         k: (N, L, H)
         v: (N, L, H)
+        key_padding_mask: (N, L)
         return contexts (N, L, H)
         """
         N, _, _ = q.size()
 
-        tmp = AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked)  # (N, L * heads, E)
-        result = tmp(q, k, v)
+        heads: List[nn.Module] = [AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked)]
+        result = heads[-1](q, k, v, key_padding_mask)  # (N, L, E * heads)
         for _ in range(self.heads - 1):
-            tmp = AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked)
-            head = tmp(q, k, v)  # (N, L, E)
-            result = torch.cat((result, head), dim=2)
+            heads.append(AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked))
+            head = heads[-1](q, k, v, key_padding_mask)  # (N, L, E)
+            result = torch.cat((result, head), dim=-1)
 
         context = self.linear_o(result)  # (N, L, H)
 
@@ -203,11 +335,13 @@ class AttentionLayer(nn.Module):
         self.linear_o = nn.Linear(encoding_size, hidden_size)
         self.masked = masked
 
+        self.max_length = max_length
+
         # const tensor in register_buffer
         # 나중에 model.device("cuda") 모델과 함께 상수텐서도 같이 GPU load
         self.register_buffer("subsequent_mask", subsequent_mask(max_length))
 
-    def forward(self, q, k, v) -> torch.Tensor:
+    def forward(self, q, k, v, key_padding_mask: torch.LongTensor) -> torch.Tensor:
         N, L, _ = q.size()
 
         q = self.linear_q(q)  # (N, L, E)
@@ -216,11 +350,25 @@ class AttentionLayer(nn.Module):
 
         sim = q @ k.permute(0, 2, 1)  # (N, L, L)
 
-        if self.masked:
-            mask = self.subsequent_mask.repeat(N, 1, 1)  # (L, L) --> (N, L, L)
-            sim = sim.masked_fill(mask == 0, value=float("-inf"))
+        mask = self.build_mask(key_padding_mask)
+        sim = sim.masked_fill(mask == 0, value=float("-inf"))
 
         attention = F.softmax(sim / math.sqrt(L), dim=-1)  # (N, L, L)
+
         context = attention @ v  # (N, L, L) @ (N, L, E) --> (N, L, E)
 
         return context
+
+    def build_mask(self, key_padding_mask: torch.LongTensor) -> torch.LongTensor:
+        """
+        key_padding_mask (N, L)
+        """
+        # mask padding_tokens
+        pad_mask = key_padding_mask.unsqueeze(-1).repeat(1, 1, self.max_length)  # (N, L) --> (N, L, L)
+
+        # subsequent mask for auto-regressive inference
+        if self.masked:
+            mask = self.subsequent_mask.repeat(pad_mask.shape[0], 1, 1)  # (L, L) --> (N, L, L)
+            pad_mask = torch.logical_and(pad_mask, mask).long()  # AND
+
+        return pad_mask
