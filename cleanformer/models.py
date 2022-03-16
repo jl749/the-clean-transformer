@@ -301,6 +301,11 @@ class MultiHeadAttentionLayer(nn.Module):
 
         self.linear_o = nn.Linear(encoding_size * heads, hidden_size)
 
+        self.heads = torch.nn.ModuleList([
+            AttentionLayer(hidden_size, encoding_size, max_length, masked)
+            for _ in range(heads)
+        ])
+
     # override
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 key_padding_mask: torch.LongTensor) -> torch.Tensor:
@@ -313,11 +318,9 @@ class MultiHeadAttentionLayer(nn.Module):
         """
         N, _, _ = q.size()
 
-        heads: List[nn.Module] = [AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked)]
-        result = heads[-1](q, k, v, key_padding_mask)  # (N, L, E * heads)
-        for _ in range(self.heads - 1):
-            heads.append(AttentionLayer(self.hidden_size, self.encoding_size, self.max_length, self.masked))
-            head = heads[-1](q, k, v, key_padding_mask)  # (N, L, E)
+        result = self.heads[0](q, k, v, key_padding_mask)
+        for attention in self.heads[1:]:
+            head = attention(q, k, v, key_padding_mask)  # (N, L, E)
             result = torch.cat((result, head), dim=-1)
 
         context = self.linear_o(result)  # (N, L, H)
