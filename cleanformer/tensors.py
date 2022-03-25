@@ -2,6 +2,7 @@
 any constant tensors are defined here.
 they will be registered as buffers.
 """
+import numpy as np
 import torch
 
 
@@ -36,3 +37,30 @@ def pos_encodings(max_length: int, hidden_size: int) -> torch.Tensor:
     # A: so that dist(PE(pos + k) - PE(pos)) stays constant
 
     return encodings
+
+
+def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                                 key_mask: torch.LongTensor) -> torch.Tensor:
+    """
+    Definition: Attention(Q, K, V) = softmax(Q dot K^T / sqrt(d_k)) dot V
+    What it does: soft-align values with respect to the similarities of their keys to each query
+    param q: (..., L, H)
+    param k: (..., L, H)
+    param v: (..., L, H)
+    key_mask: (..., L, L)
+    """
+    # Q * K^T:  compute query-key similarities
+    sims = q @ k.transpose(-1, -2)  # torch.einsum("...qh,...kh->...qk", q, k)
+
+    # Q * K^T / sqrt(d_k): down-scale similarities to prevent gradient vanishing
+    sims /= np.sqrt(k.shape[-1])
+
+    # apply padding mask and/or subsequent mask
+    sims = sims.masked_fill(key_mask == 0, float("-inf"))
+
+    # softmax(Q * K^T / sqrt(d_k)): normalise the sims over keys
+    attentions = torch.softmax(sims, dim=-1)  # (..., L, L)
+
+    # softmax(Q * K^T / sqrt(d_k)) * V: soft-align values with respect to each query
+    alignments = attentions @ v  # torch.einsum("...qv,...vh->...qh", attentions, v)
+    return alignments

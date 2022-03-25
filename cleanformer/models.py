@@ -3,7 +3,7 @@ from typing import Dict, Tuple, List
 
 from tqdm import tqdm
 
-from cleanformer.tensors import subsequent_mask, pos_encodings
+from cleanformer.tensors import subsequent_mask, pos_encodings, scaled_dot_product_attention
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -293,18 +293,22 @@ class MultiHeadAttentionLayer(nn.Module):
         masked = masked MultiHeadAttention?
         """
         super().__init__()
+        assert encoding_size % heads == 0, "hidden_size(H) --> encoding_size(E) must be divisible by # of heads"
         self.hidden_size = hidden_size
         self.encoding_size = encoding_size
         self.heads = heads  # how many heads?
         self.max_length = max_length  # L
         self.masked = masked
 
-        self.linear_o = nn.Linear(encoding_size * heads, hidden_size)
+        self.linear_q = nn.Linear(hidden_size, encoding_size)
+        self.linear_k = nn.Linear(hidden_size, encoding_size)
+        self.linear_v = nn.Linear(hidden_size, encoding_size)
+        self.linear_o = nn.Linear(encoding_size, hidden_size)
 
-        self.heads = torch.nn.ModuleList([
-            AttentionLayer(hidden_size, encoding_size, max_length, masked)
-            for _ in range(heads)
-        ])
+        self.norm = torch.nn.LayerNorm(hidden_size)
+
+        # const tensor (for masked attention)
+        self.register_buffer("subsequent_mask", subsequent_mask(max_length))  # (L, L)
 
     # override
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -318,60 +322,31 @@ class MultiHeadAttentionLayer(nn.Module):
         """
         N, _, _ = q.size()
 
-        result = self.heads[0](q, k, v, key_padding_mask)
-        for attention in self.heads[1:]:
-            head = attention(q, k, v, key_padding_mask)  # (N, L, E)
-            result = torch.cat((result, head), dim=-1)
-
-        context = self.linear_o(result)  # (N, L, H)
-
-        return context
-
-
-class AttentionLayer(nn.Module):
-
-    def __init__(self, hidden_size: int, encoding_size: int, max_length: int, masked: bool) -> None:
-        super().__init__()
-        self.linear_q = nn.Linear(hidden_size, encoding_size)
-        self.linear_k = nn.Linear(hidden_size, encoding_size)
-        self.linear_v = nn.Linear(hidden_size, encoding_size)
-        self.linear_o = nn.Linear(encoding_size, hidden_size)
-        self.masked = masked
-
-        self.max_length = max_length
-
-        # const tensor in register_buffer
-        # 나중에 model.device("cuda") 모델과 함께 상수텐서도 같이 GPU load
-        self.register_buffer("subsequent_mask", subsequent_mask(max_length))
-
-    def forward(self, q, k, v, key_padding_mask: torch.LongTensor) -> torch.Tensor:
-        N, L, _ = q.size()
-
         q = self.linear_q(q)  # (N, L, E)
         k = self.linear_k(k)  # (N, L, E)
         v = self.linear_v(v)  # (N, L, E)
 
-        sim = q @ k.permute(0, 2, 1)  # (N, L, L)
+        q = q.reshape(N, self.max_length, self.heads, self.encoding_size // self.heads)  # (N, L, heads, head_size)
+        k = k.reshape(N, self.max_length, self.heads, self.encoding_size // self.heads)  # (N, L, heads, head_size)
+        v = v.reshape(N, self.max_length, self.heads, self.encoding_size // self.heads)  # (N, L, heads, head_size)
+        q = q.permute(0, 2, 1, 3)  # (N, heads, L, head_size)
+        k = k.permute(0, 2, 1, 3)  # (N, heads, L, head_size)
+        v = v.permute(0, 2, 1, 3)  # (N, heads, L, head_size)
 
-        mask = self.build_mask(key_padding_mask)
-        sim = sim.masked_fill(mask == 0, value=float("-inf"))
+        # (N, L) --> (N, heads, L, L)
+        key_mask = key_padding_mask.reshape(N, 1, self.max_length, 1).repeat(1, self.heads, 1, self.max_length)
 
-        attention = F.softmax(sim / math.sqrt(L), dim=-1)  # (N, L, L)
+        if self.masked:  # for auto-regressive inference at decoder
+            key_subsequent_mask = self.subsequent_mask.unsqueeze(0).unsqueeze(0).\
+                expand(N, self.heads, -1, -1)  # (L, L) -> (1, 1, L, L) -> (N, heads, L, L)
+            key_mask = torch.logical_and(key_mask, key_subsequent_mask).long()
 
-        context = attention @ v  # (N, L, L) @ (N, L, E) --> (N, L, E)
+        contexts = scaled_dot_product_attention(q, k, v, key_mask)
+        # concat(head_1, head_2, ... head_heads): concatenate multiple alignments
+        # (N, heads, L, head_size) -> (N, L, heads, head_size) -> (N, L, E)
+        concats = contexts.transpose(1, 2).contiguous() \
+            .reshape(-1, self.max_length, self.encoding_size)  # .contiguous() --> merging heads, head_size
 
-        return context
-
-    def build_mask(self, key_padding_mask: torch.LongTensor) -> torch.LongTensor:
-        """
-        key_padding_mask (N, L)
-        """
-        # mask padding_tokens
-        pad_mask = key_padding_mask.unsqueeze(-1).repeat(1, 1, self.max_length)  # (N, L) --> (N, L, L)
-
-        # subsequent mask for auto-regressive inference
-        if self.masked:
-            mask = self.subsequent_mask.repeat(pad_mask.shape[0], 1, 1)  # (L, L) --> (N, L, L)
-            pad_mask = torch.logical_and(pad_mask, mask).long()  # AND
-
-        return pad_mask
+        # concat(head_1, head_2, ... head_heads) * W_o: aggregate alignments
+        contexts = self.linear_o(concats)  # (N, L, E) * (E, H) -> (N, L, H)
+        return self.norm(contexts)  # layer normalisation

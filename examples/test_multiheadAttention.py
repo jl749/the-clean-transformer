@@ -10,7 +10,8 @@ def main():
     N = 10
     L = 30
 
-    layer = MultiHeadAttentionLayer(hidden_size, encoding_size, heads, max_length=L, masked=False)
+    # layer = MultiHeadAttentionLayer(hidden_size, encoding_size, heads, max_length=L, masked=False)
+    layer = MultiHeadAttentionLayer(hidden_size, encoding_size, heads, max_length=L, masked=True)
 
     q = torch.rand(size=[N, L, hidden_size])
     k = torch.rand(size=[N, L, hidden_size])
